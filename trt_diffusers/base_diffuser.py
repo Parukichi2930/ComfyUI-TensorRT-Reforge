@@ -1,4 +1,5 @@
 from typing import Any, Optional, cast, Literal
+import threading
 
 import numpy as np
 from tqdm import tqdm
@@ -11,17 +12,25 @@ import comfy.model_management
 
 from ..definitions import SupportedModelType, WeightsNameMap, WeightsShapeMap, PatchType, ModelInputNames, ModelInputMapping, trt_logger
 from ..trt_utils import trt_datatype_to_torch, torch_dtype_to_trt
+from ..trt_compat import split_batch_size
 
 SupportedModelName = [e.name for e in SupportedModelType]
 
 class TRTDiffuser:
     def __init__(self, engine: trt.ICudaEngine, weight_map: Optional[WeightsNameMap] = None, shape_map: Optional[WeightsShapeMap] = None) -> None:        
+        if engine is None:
+            raise RuntimeError("TensorRT could not deserialize this engine. Rebuild it with this GPU/TensorRT version; see the TensorRT log.")
         self.engine = engine
         
         trt_dtype = self.engine.get_tensor_dtype(self.engine.get_tensor_name(0))
 
         self.dtype = trt_datatype_to_torch(trt_dtype)
         self.context = self.engine.create_execution_context()
+        if self.context is None:
+            raise RuntimeError("TensorRT could not create an execution context (check free VRAM).")
+        self.device = comfy.model_management.get_torch_device()
+        self._execution_lock = threading.Lock()
+        self._last_execution = None
 
         self.model_input_names: ModelInputNames = {
             "latent": "",
@@ -45,6 +54,10 @@ class TRTDiffuser:
         self.refit_compute_device: torch.device = cast(torch.device, comfy.model_management.get_torch_device())
 
         self._rename_inputs()
+        latent_name = self.model_input_names["latent"]
+        if not latent_name or not self.model_input_names["timestep"]:
+            raise ValueError("Engine is missing latent/timestep inputs.")
+        self.dtype = trt_datatype_to_torch(self.engine.get_tensor_dtype(latent_name))
 
     def _rename_inputs(self):
         engine_model_input_names: list[str] = []
@@ -69,66 +82,87 @@ class TRTDiffuser:
         self.model_output_names = engine_model_output_names
 
     def __call__(self, latent: torch.Tensor, timestep: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-
+        if kwargs.get("control") is not None:
+            raise ValueError("ControlNet is not part of this TensorRT graph. Use the PyTorch model for this workflow.")
+        options = kwargs.get("transformer_options") or {}
+        if any(options.get(key) for key in ("patches", "patches_replace", "wrappers")):
+            raise ValueError("Runtime transformer patches cannot be applied to a compiled TensorRT graph.")
+        if latent.device.type != "cuda" or latent.device != self.device:
+            raise ValueError(f"Engine is on {self.device}; received latent on {latent.device}.")
         model_inputs: dict[str, torch.Tensor] = {self.model_input_names["latent"]: latent, self.model_input_names["timestep"]: timestep}
 
         for arg, value in kwargs.items():
             for key, aliases in self.input_aliases_map.items():
-                if arg in cast(list[str], aliases) and self.model_input_names[key] is not None:
+                if arg in cast(list[str], aliases) and self.model_input_names[key] is not None and value is not None:
                     model_inputs[self.model_input_names[key]] = value
                     break
         
-        batch_size = latent.shape[0]
-        dims = self.engine.get_tensor_profile_shape(self.engine.get_tensor_name(0), 0)
-        min_batch = dims[0][0]
-        # opt_batch = dims[1][0]
-        max_batch = dims[2][0]
+        expected = {self.engine.get_tensor_name(i) for i in range(self.engine.num_io_tensors)
+                    if self.engine.get_tensor_mode(self.engine.get_tensor_name(i)) == trt.TensorIOMode.INPUT}
+        if expected != set(model_inputs):
+            raise ValueError(f"Engine input mismatch: expected {sorted(expected)}, received {sorted(model_inputs)}")
+        if len(self.model_output_names) != 1:
+            raise ValueError("Only single-output diffusion engines are supported.")
+        for name in expected | set(self.model_output_names):
+            if self.engine.get_tensor_location(name) != trt.TensorLocation.DEVICE:
+                raise ValueError(f"Host tensor binding is unsupported: {name}")
+            if self.engine.get_tensor_format(name) != trt.TensorFormat.LINEAR:
+                raise ValueError(f"Non-linear tensor binding is unsupported: {name}")
 
-        curr_split_batch = 1
-        for i in range(max_batch, min_batch - 1, -1):
-            if batch_size % i == 0:
-                curr_split_batch = batch_size // i
-                break
-
-        self._set_bindings_shape(model_inputs, curr_split_batch)
-
-        model_inputs_converted: dict[str, torch.Tensor] = {}
-        for arg, tensor in model_inputs.items():
-            data_type = self.engine.get_tensor_dtype(arg)
-            model_inputs_converted[arg] = tensor.to(dtype=trt_datatype_to_torch(data_type))
-
-        assert len(self.model_output_names) == 1, "Only single output is supported"
-        output_binding_name = self.model_output_names[0]
-        out_shape_tuple = self.engine.get_tensor_shape(output_binding_name)
-        out_shape: list[int] = list(out_shape_tuple)
-
-        for idx in range(len(out_shape)):
-            if out_shape[idx] == -1:
-                out_shape[idx] = latent.shape[idx]
-            else:
-                if idx == 0:
-                    out_shape[idx] *= curr_split_batch
-
-        out = torch.empty(out_shape, 
-                          device=latent.device, 
-                          dtype=trt_datatype_to_torch(self.engine.get_tensor_dtype(output_binding_name)))
-        model_inputs_converted[output_binding_name] = out
-
-        stream = torch.cuda.default_stream(latent.device)
-        for i in range(curr_split_batch):
-            for arg, tensor in model_inputs_converted.items():
-                chunk_size = tensor.shape[0] // curr_split_batch
-                self.context.set_tensor_address(arg, tensor[chunk_size * i:].data_ptr())
-            self.context.execute_async_v3(stream_handle=stream.cuda_stream)
-        return out
-
-    def _set_bindings_shape(self, inputs: dict[str, torch.Tensor], split_batch: int) -> None:
-        for k, tensor in inputs.items():
-            shape = list(tensor.shape)
-            shape[0] = shape[0] // split_batch
-            self.context.set_input_shape(k, shape)
+        batch = latent.shape[0]
+        low, _, high = self.engine.get_tensor_profile_shape(self.model_input_names["latent"], 0)
+        chunk_size = split_batch_size(batch, low[0], high[0])
+        output_name = self.model_output_names[0]
+        # An execution context cannot be reconfigured while its previous enqueue
+        # is still running, including calls made from a different CUDA stream.
+        with self._execution_lock, torch.cuda.device(latent.device):
+            if self._last_execution is not None:
+                self._last_execution.synchronize()
+            stream = torch.cuda.current_stream(latent.device)
+            converted = {}
+            for name, tensor in model_inputs.items():
+                if tensor.ndim == 0:
+                    tensor = tensor.reshape(1)
+                if tensor.shape[0] == 1 and batch != 1:
+                    tensor = tensor.expand(batch, *tensor.shape[1:])
+                if tensor.shape[0] != batch:
+                    raise ValueError(f"{name} batch {tensor.shape[0]} does not match latent batch {batch}.")
+                tensor = tensor.to(device=latent.device, dtype=trt_datatype_to_torch(self.engine.get_tensor_dtype(name))).contiguous()
+                shape = (chunk_size, *tensor.shape[1:])
+                minimum, _, maximum = self.engine.get_tensor_profile_shape(name, 0)
+                if len(shape) != len(minimum) or any(v < a or v > b for v, a, b in zip(shape, minimum, maximum)):
+                    raise ValueError(f"{name} shape {shape} is outside engine profile {tuple(minimum)}..{tuple(maximum)}. Re-export for this resolution/prompt length.")
+                if not self.context.set_input_shape(name, shape):
+                    raise RuntimeError(f"TensorRT rejected input shape {name}={shape}")
+                converted[name] = tensor
+            missing = self.context.infer_shapes()
+            if missing:
+                raise RuntimeError(f"TensorRT shapes remain unspecified: {missing}")
+            shape = tuple(self.context.get_tensor_shape(output_name))
+            if not shape or any(v <= 0 for v in shape) or shape[0] != chunk_size:
+                raise RuntimeError(f"Invalid TensorRT output shape: {shape}")
+            output = torch.empty((batch, *shape[1:]), device=latent.device,
+                                 dtype=trt_datatype_to_torch(self.engine.get_tensor_dtype(output_name)))
+            try:
+                for start in range(0, batch, chunk_size):
+                    bindings = {name: tensor[start:start + chunk_size] for name, tensor in converted.items()}
+                    bindings[output_name] = output[start:start + chunk_size]
+                    for name, tensor in bindings.items():
+                        if not self.context.set_tensor_address(name, tensor.data_ptr()):
+                            raise RuntimeError(f"TensorRT rejected tensor address for {name}")
+                        tensor.record_stream(stream)
+                    if not self.context.execute_async_v3(stream_handle=stream.cuda_stream):
+                        raise RuntimeError("TensorRT execute_async_v3 failed; see the TensorRT log.")
+            finally:
+                # Keep the allocator and the next caller aware of outstanding work,
+                # even when a later chunk fails after an earlier successful enqueue.
+                self._last_execution = torch.cuda.Event()
+                self._last_execution.record(stream)
+            return output
 
     def refit(self):
+        if int(trt.__version__.split('.')[0]) >= 11:
+            raise RuntimeError("LoRA/Refit is outside the validated TensorRT 11 SDXL path. Use an engine exported with enable_lora=False.")
         self._validate_refit_support()
         refitter = trt.Refitter(self.engine, trt_logger)
         keep_weights: dict[str, torch.Tensor] = {}

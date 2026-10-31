@@ -7,7 +7,6 @@ import mmap
 import gc
 import torch
 import tensorrt as trt
-import onnxruntime as ort
 import folder_paths
 from onnx import helper, TensorProto
 from onnx.onnx_pb import ModelProto
@@ -24,7 +23,8 @@ class BundleEntryType(enum.Enum):
 
 class ModelBundle:
     def __init__(self, bundle_path: str):
-        self.bundle_path = ensure_temp_or_output_path(bundle_path)
+        # Loader bundles may live in models/tensorrt, outside output/temp.
+        self.bundle_path = os.path.realpath(bundle_path)
         self._file = open(self.bundle_path, "r+b")
         self._mm: Optional[mmap.mmap] = None
         self._entry_views: dict[BundleEntryType, memoryview] = {}
@@ -424,6 +424,7 @@ def torch_dtype_to_trt(datatype: torch.dtype) -> trt.DataType:
 def check_cuda_compatibility() -> bool:
     """
     Check if CUDA is available and compatible with ONNX Runtime."""
+    import onnxruntime as ort  # Optional: only Anima's adapter uses ORT.
     node = helper.make_node("Add", ["A", "B"], ["C"])
     graph = helper.make_graph([node], "test", [
         helper.make_tensor_value_info("A", TensorProto.DataType.FLOAT, [1]),

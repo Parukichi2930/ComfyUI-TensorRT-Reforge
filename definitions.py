@@ -45,6 +45,9 @@ class TRTSpec(TypedDict):
     model_name: str
     filename_prefix: str
     enable_lora: bool
+    precision: str
+    onnx_exporter: str
+    workspace_gib: int
 
     opt_batch_size: int
     opt_width: int
@@ -80,4 +83,3 @@ class ModelInputMapping(TypedDict):
     timestep: list[str]
     context: list[str]
     vector_cond: list[str]
-    

@@ -18,7 +18,7 @@ import folder_paths
 from .definitions import SupportedModelType, WeightsNameMap, WeightsShapeMap, PatchType, trt_runtime
 from .trt_utils import ModelBundle, BundleEntryType
 from .trt_diffusers.base_diffuser import TRTDiffuser
-from .trt_diffusers.anima_diffuser import TRTAnimaDiffuser
+from .trt_compat import read_engine_metadata, sdxl_sampling_config
 
 SupportedModelName = [e.name for e in SupportedModelType]
 
@@ -45,8 +45,9 @@ class TRTLoader(io.ComfyNode):
                     id="model_type",
                     display_name="Model Type",
                     options=SupportedModelName,
-                    default="sdxl_base"
+                    default="SDXL"
                 ),
+                io.Combo.Input(id="sampling", options=["auto", "eps", "v_prediction", "v_prediction_zsnr"], default="auto"),
             ],
             outputs=[
                 io.Model.Output(id="engine", display_name="MODEL"),   
@@ -57,82 +58,97 @@ class TRTLoader(io.ComfyNode):
     @classmethod
     @override
     def execute(cls, **kwargs: dict[str, str]) -> io.NodeOutput:
-        model_path = cast(str, kwargs["model_path"])
+        return io.NodeOutput(_load_tensorrt_model(
+            kwargs["model_path"], kwargs["model_type"], kwargs.get("sampling", "auto")))
 
-        try:
-            model_type = SupportedModelType[cast(str, kwargs["model_type"])]
-        except KeyError:
-            raise ValueError(f"Unexpected model_type: {kwargs['model_type']}. Supported types are: {SupportedModelName}")
 
-        full_path: Optional[str] = folder_paths.get_full_path("tensorrt", model_path)
-        if full_path is None or not os.path.isfile(full_path):
-            raise FileNotFoundError(f"File {model_path} does not exist in tensorrt path")
+def _load_tensorrt_model(model_path: str, model_type_name: str, sampling: str = "auto") -> "TRTModelPatcher":
+    try:
+        model_type = SupportedModelType[model_type_name]
+    except KeyError:
+        raise ValueError(f"Unexpected model_type: {model_type_name}. Supported types are: {SupportedModelName}")
 
-        diffuser: TRTDiffuser
-        weight_mapping: Optional[WeightsNameMap] = None
-        shape_mapping: Optional[WeightsShapeMap] = None
-        metadata: Optional[dict[str, Any]] = None
+    full_path: Optional[str] = folder_paths.get_full_path("tensorrt", model_path)
+    if full_path is None or not os.path.isfile(full_path):
+        raise FileNotFoundError(f"File {model_path} does not exist in tensorrt path")
 
-        if full_path.endswith(".bundle"):
-            model_bundle = ModelBundle(full_path)
-            weight_mapping, shape_mapping = model_bundle.get(BundleEntryType.WEIGHTS_MAP, (None, None))
-            metadata = model_bundle.metadata
-            if model_type == SupportedModelType.Anima:
-                onnx_model, trt_engine = model_bundle[BundleEntryType.ONNX_MODEL], model_bundle[BundleEntryType.TRT_ENGINE]
-                diffuser = TRTAnimaDiffuser(engine=trt_engine, onnx_model=onnx_model, device=cast(torch.device, comfy.model_management.get_torch_device()), weight_map=weight_mapping, shape_map=shape_mapping)
-            else:
-                trt_engine = model_bundle[BundleEntryType.TRT_ENGINE]
-                diffuser = TRTDiffuser(engine=trt_engine, weight_map=weight_mapping, shape_map=shape_mapping)
+    diffuser: TRTDiffuser
+    weight_mapping: Optional[WeightsNameMap] = None
+    shape_mapping: Optional[WeightsShapeMap] = None
+    metadata: Optional[dict[str, Any]] = None
+    export_metadata = read_engine_metadata(full_path)
+
+    if full_path.endswith(".bundle"):
+        model_bundle = ModelBundle(full_path)
+        weight_mapping, shape_mapping = model_bundle.get(BundleEntryType.WEIGHTS_MAP, (None, None))
+        metadata = model_bundle.metadata
+        export_metadata = metadata.get("export_metadata", export_metadata)
+        if model_type == SupportedModelType.Anima:
+            from .trt_diffusers.anima_diffuser import TRTAnimaDiffuser
+            onnx_model, trt_engine = model_bundle[BundleEntryType.ONNX_MODEL], model_bundle[BundleEntryType.TRT_ENGINE]
+            diffuser = TRTAnimaDiffuser(engine=trt_engine, onnx_model=onnx_model, device=cast(torch.device, comfy.model_management.get_torch_device()), weight_map=weight_mapping, shape_map=shape_mapping)
         else:
-            with open(full_path, "rb") as f:
-                deserialized_engine = trt_runtime.deserialize_cuda_engine(f.read())
-            diffuser = TRTDiffuser(engine=deserialized_engine)
+            trt_engine = model_bundle[BundleEntryType.TRT_ENGINE]
+            diffuser = TRTDiffuser(engine=trt_engine, weight_map=weight_mapping, shape_map=shape_mapping)
+        model_bundle.close()
+    else:
+        with open(full_path, "rb") as f:
+            deserialized_engine = trt_runtime.deserialize_cuda_engine(f.read())
+        diffuser = TRTDiffuser(engine=deserialized_engine)
 
-        match model_type:
-            case SupportedModelType.SD15:
-                config = comfy.supported_models.SD15(model_type.value.config)
-                config.unet_config["disable_unet_model_creation"] = True # pyright: ignore[reportUnknownMemberType]
-                model = comfy.model_base.BaseModel(config)
-            case SupportedModelType.SDXL:
-                config = comfy.supported_models.SDXL(model_type.value.config)
-                config.unet_config["disable_unet_model_creation"] = True # pyright: ignore[reportUnknownMemberType]
-                model = comfy.model_base.SDXL(config)
-            case SupportedModelType.AuraFlow:
-                config = comfy.supported_models.AuraFlow(model_type.value.config)
-                config.unet_config["disable_unet_model_creation"] = True
-                model = config.get_model({}) # pyright: ignore[reportUnknownMemberType]
-            case SupportedModelType.Flux:
-                config = comfy.supported_models.Flux(model_type.value.config)
-                config.unet_config["disable_unet_model_creation"] = True # pyright: ignore[reportUnknownMemberType]
-                model = config.get_model({}) # pyright: ignore[reportUnknownMemberType]
-            case SupportedModelType.SD3:
-                config = comfy.supported_models.SD3(model_type.value.config)
-                config.unet_config["disable_unet_model_creation"] = True # pyright: ignore[reportUnknownMemberType]
-                model = config.get_model({}) # pyright: ignore[reportUnknownMemberType]
-            case SupportedModelType.Anima:
-                config = comfy.supported_models.Anima(model_type.value.config)
-                config.unet_config["disable_unet_model_creation"] = True # pyright: ignore[reportArgumentType]
-                model = config.get_model({}) # pyright: ignore[reportUnknownMemberType]
-            case SupportedModelType.SVD:
-                config = comfy.supported_models.SVD_img2vid(model_type.value.config)
-                config.unet_config["disable_unet_model_creation"] = True # pyright: ignore[reportUnknownMemberType]
-                model = config.get_model({}) # pyright: ignore[reportUnknownMemberType]
-            case _:
-                raise ValueError(f"Unsupported model type: {model_type}")
+    if export_metadata and export_metadata["model_family"] != model_type.name:
+        raise ValueError(f"Engine was exported as {export_metadata['model_family']}, not {model_type.name}.")
 
-        model.diffusion_model = diffuser # pyright: ignore[reportAttributeAccessIssue]
-        model.memory_required = lambda *args, **kwargs: 0 # type: ignore
+    match model_type:
+        case SupportedModelType.SD15:
+            config = comfy.supported_models.SD15(model_type.value.config)
+            config.unet_config["disable_unet_model_creation"] = True # pyright: ignore[reportUnknownMemberType]
+            model = comfy.model_base.BaseModel(config)
+        case SupportedModelType.SDXL:
+            prediction, settings = sdxl_sampling_config(export_metadata, sampling)
+            config = comfy.supported_models.SDXL(
+                export_metadata["unet_config"] if export_metadata else model_type.value.config)
+            config.sampling_settings = settings
+            config.unet_config["disable_unet_model_creation"] = True # pyright: ignore[reportUnknownMemberType]
+            model = comfy.model_base.SDXL(config, model_type=comfy.model_base.ModelType[prediction])
+        case SupportedModelType.AuraFlow:
+            config = comfy.supported_models.AuraFlow(model_type.value.config)
+            config.unet_config["disable_unet_model_creation"] = True
+            model = config.get_model({}) # pyright: ignore[reportUnknownMemberType]
+        case SupportedModelType.Flux:
+            config = comfy.supported_models.Flux(model_type.value.config)
+            config.unet_config["disable_unet_model_creation"] = True # pyright: ignore[reportUnknownMemberType]
+            model = config.get_model({}) # pyright: ignore[reportUnknownMemberType]
+        case SupportedModelType.SD3:
+            config = comfy.supported_models.SD3(model_type.value.config)
+            config.unet_config["disable_unet_model_creation"] = True # pyright: ignore[reportUnknownMemberType]
+            model = config.get_model({}) # pyright: ignore[reportUnknownMemberType]
+        case SupportedModelType.Anima:
+            config = comfy.supported_models.Anima(model_type.value.config)
+            config.unet_config["disable_unet_model_creation"] = True # pyright: ignore[reportArgumentType]
+            model = config.get_model({}) # pyright: ignore[reportUnknownMemberType]
+        case SupportedModelType.SVD:
+            config = comfy.supported_models.SVD_img2vid(model_type.value.config)
+            config.unet_config["disable_unet_model_creation"] = True # pyright: ignore[reportUnknownMemberType]
+            model = config.get_model({}) # pyright: ignore[reportUnknownMemberType]
+        case _:
+            raise ValueError(f"Unsupported model type: {model_type}")
 
-        patcher = TRTModelPatcher(
-            model,
-            load_device=cast(torch.device, comfy.model_management.get_torch_device()),
-            offload_device=cast(torch.device, comfy.model_management.unet_offload_device()),
-            weight_mapping=weight_mapping,
-            shape_mapping=shape_mapping,
-            bundle_metadata=metadata
-        )
+    model.diffusion_model = diffuser # pyright: ignore[reportAttributeAccessIssue]
+    model.memory_required = lambda *args, **kwargs: 0 # type: ignore
 
-        return (io.NodeOutput(patcher))
+    patcher = TRTModelPatcher(
+        model,
+        load_device=cast(torch.device, comfy.model_management.get_torch_device()),
+        offload_device=cast(torch.device, comfy.model_management.unet_offload_device()),
+        weight_mapping=weight_mapping,
+        shape_mapping=shape_mapping,
+        bundle_metadata=metadata
+    )
+
+    patcher.cached_patcher_init = (_load_tensorrt_model, (model_path, model_type.name, sampling))
+    return patcher
+
 
 def _ensure_tensorrt_search_paths() -> list[str]:
     models_trt_dir = os.path.join(folder_paths.models_dir, "tensorrt")
@@ -152,8 +168,8 @@ def _ensure_tensorrt_search_paths() -> list[str]:
     return folder_paths.get_filename_list("tensorrt")
 
 class TRTModelPatcher(comfy.model_patcher.ModelPatcher):
-    def __init__(self, model: comfy.model_base.BaseModel, load_device: torch.device, offload_device: torch.device, size: int = 0, weight_inplace_update: bool=False, weight_mapping: Optional[WeightsNameMap] = None, shape_mapping: Optional[WeightsShapeMap] = None, bundle_metadata: Optional[dict[str, Any]] = None) -> None:
-        super().__init__(model, load_device, offload_device, size=size, weight_inplace_update=weight_inplace_update)
+    def __init__(self, model: comfy.model_base.BaseModel, load_device: torch.device, offload_device: torch.device, size: int = 0, weight_inplace_update: bool=False, weight_mapping: Optional[WeightsNameMap] = None, shape_mapping: Optional[WeightsShapeMap] = None, bundle_metadata: Optional[dict[str, Any]] = None, fast_disk: bool=False) -> None:
+        super().__init__(model, load_device, offload_device, size=size, weight_inplace_update=weight_inplace_update, fast_disk=fast_disk)
         self.weight_mapping = weight_mapping
         self.shape_mapping = shape_mapping
         self.original_weight_path = self._resolve_original_weight(bundle_metadata)
@@ -186,6 +202,7 @@ class TRTModelPatcher(comfy.model_patcher.ModelPatcher):
 
     @no_type_check
     def _modify_state_dict(self, state_dict: dict[str, torch.Tensor], ckpt_metadata: Optional[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        model_config = None
         diffusion_model_prefix = comfy.model_detection.unet_prefix_from_state_dict(state_dict)
         temp_sd = comfy.utils.state_dict_prefix_replace(state_dict, {diffusion_model_prefix: ""}, filter_keys=True)
         if len(temp_sd) > 0:
@@ -223,18 +240,28 @@ class TRTModelPatcher(comfy.model_patcher.ModelPatcher):
         return ret_state_dict
     
     @override
-    def clone(self, disable_dynamic: bool = False, model_override: Optional[Any] = None):
+    def clone(self, disable_dynamic: bool = False, model_override: Optional[Any] = None, force_deepcopy: bool = False):
+        if force_deepcopy:
+            raise ValueError("TensorRT contexts cannot be deep-copied. Load a separate engine for each GPU.")
         weight_mapping = self.weight_mapping
         shape_mapping = self.shape_mapping
         original_weight_path = self.original_weight_path
         dummy_state_dict = self.dummy_state_dict
-        n = cast(TRTModelPatcher, super().clone(disable_dynamic=disable_dynamic, model_override=model_override)) # pyright: ignore[reportUnknownMemberType]
+        n = cast(TRTModelPatcher, super().clone(disable_dynamic=disable_dynamic, model_override=model_override, force_deepcopy=False))
         n.weight_mapping = weight_mapping
         n.shape_mapping = shape_mapping
         n.original_weight_path = original_weight_path
         n.dummy_state_dict = dummy_state_dict
         n.model.state_dict = MethodType(n._ret_dummy_state_dict, n.model) # pyright: ignore[reportUnknownArgumentType]
         return n
+
+    @override
+    def deepclone_multigpu(self, new_load_device: Optional[torch.device] = None, models_cache=None):
+        device = self.load_device if new_load_device is None else new_load_device
+        # TensorRT binds an engine and its CUDA allocations to the device active
+        # during deserialization. Retargeting ModelPatcher metadata is insufficient.
+        with torch.cuda.device(device):
+            return super().deepclone_multigpu(new_load_device=device, models_cache=models_cache)
 
     @override
     def add_patches(self, patches: dict[str, Any], strength_patch: float = 1.0, strength_model: float = 1.0) -> list[str]:

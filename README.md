@@ -1,96 +1,97 @@
-# ComfyUI-TensorRT-Reforge
-A modernized, robust, and highly extensible TensorRT engine exporter and loader for ComfyUI.
+# ComfyUI-TensorRT-Reforge — TensorRT 11 / SDXL fork
 
-[日本語はこちら](https://qiita.com/zaochuan5854/items/f7b625bb9df5f4742b61)
+Windows ComfyUI向けに、**TensorRT 11.4・CUDA 13でのSDXL生成と、2GPUへのCFG分割**を修正したコミュニティ派生版です。既存のPyTorch環境を変更せずに導入する手順を用意しています。
 
-## 💖 Acknowledgements & Origins
-This project is a direct evolution of the original [ComfyUI_TensorRT](https://github.com/comfyanonymous/ComfyUI_TensorRT). We want to express our deepest gratitude to the original authors and contributors. Their groundbreaking work laid the foundation for running lightning-fast TensorRT models within ComfyUI. 
+This fork adds TensorRT 11 strong typing, SDXL ONNX export/runtime fixes, and native two-GPU CFG splitting. Tested on Windows with RTX 3060 12GB. Documentation is primarily in Japanese. Model weights and compiled engines are not distributed.
 
-**ComfyUI-TensorRT-Reforge** builds upon their incredible legacy. We have restructured the codebase to support modern PyTorch features and future-proofed the internal architecture, ensuring seamless support for next-generation diffusion models.
+## 元リポジトリと変更内容
 
-## ✨ Why "Reforge"? (Key Improvements)
-The generative AI landscape moves incredibly fast, bringing new and structurally complex models every month. We "reforged" the original codebase to ensure high reliability and broad compatibility across different model families:
+[zaochuan5854/ComfyUI-TensorRT-Reforge](https://github.com/zaochuan5854/ComfyUI-TensorRT-Reforge) の `0ecd7ca18bb75dc1176b8edde161d6d4b4573760` を基点にしています。その前身である [ComfyUI_TensorRT](https://github.com/comfyanonymous/ComfyUI_TensorRT) と、各プロジェクトの作者・貢献者に感謝します。
 
-* **Next-Gen "Anima" Architecture Support**: Fully optimized for the latest **Anima** model architecture. Reforge handles its unique structural requirements during the export process, ensuring you can run this cutting-edge model with full TensorRT acceleration.
-* **Dynamic LoRA Support via Refit (Experimental)**: Unlike traditional TensorRT implementations that require a full engine rebuild for each LoRA, Reforge utilizes NVIDIA's **Refit** technology. This allows for near-instant weight swapping, enabling you to use LoRAs with TensorRT speed without the agonizing wait.
-* **Dynamo-Powered ONNX Exporting**: We utilize PyTorch's Dynamo (`dynamo=True`) alongside traditional tracing. This ensures significantly higher success rates when exporting mathematically complex architectures that previously failed in older versions.
-* **Dynamic Opset Management**: Automatically adjusts ONNX Opsets (e.g., 18 vs 25) based on the specific model's requirements—essential for supporting advanced features in models like Anima and Flux.
+- TensorRT 11のstrong typingに対応し、古い精度フラグへの依存を除去。
+- SDXLのFP16・opset18・外部重みを使うONNX書き出し、入力形状と予測方式の保存・復元を修正。
+- 現在のComfyUI API、CUDA current stream、出力バッファ、CFGバッチ分割を修正。
+- 標準の `MultiGPU CFG Split` 向けに、対象GPU上で独立したengineを再読み込みする処理を追加。
+- ONNX補助ライブラリをノード内の `.deps` に配置。インストーラーはPyTorch/TensorRTを追加・更新しません。
 
-## 🚀 Supported Models
-Current architecture routing officially supports:
-* **Anima (New!)**
-* Flux
-* SD3 / SD3.5
-* SDXL
-* SD 1.5
-* AuraFlow
-* SVD (Stable Video Diffusion)
+変更日と概要は [CHANGELOG.md](CHANGELOG.md)、具体的な導入・エクスポート手順は [WINDOWS_TRT11_SDXL.md](WINDOWS_TRT11_SDXL.md) を参照してください。
 
-## 📦 Installation
+## 検証した環境
 
-**Requirement: This node requires a CUDA 12.x environment, with CUDA 12.8 being highly recommended for optimal performance and stability. If you are using CUDA 11, please update your drivers and toolkit. Additionally, CUDA 13.x is not currently supported at this time.**
+| 項目 | 検証環境 |
+|---|---|
+| OS / Python | Windows 11 x64 / Python 3.13.12 |
+| ComfyUI | `426f5eea52a7ece1dd599fff4cb6cd1f352ddd24`（v0.43.0） |
+| PyTorch | `2.12.1+cu130` |
+| TensorRT | cu13 / `11.4.0.106` |
+| GPU | RTX 3060 12GB、単GPUと同型2枚 |
+| 実モデル | WAI Illustrious SDXL v17 |
 
-1. Clone this repository into your `ComfyUI/custom_nodes` directory:
-   ```bash
-   cd ComfyUI/custom_nodes
-   git clone https://github.com/zaochuan5854/ComfyUI-TensorRT-Reforge.git
-   ```
-2. Install the necessary Python packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
+WAI v17の512/1024用engine構築と推論、1024×1024・CFG4・20ステップの単GPU／2GPU生成を確認しました。GPU検証は2026-10-27の作業記録に基づきます。全環境への互換性や速度向上率を保証するものではありません。[実機検証報告](VALIDATION_TRT11_SDXL.md)
 
-## 🧠 Technical Deep Dive: Why is it so fast?
+**NoobAIの実チェックポイントは未検証です。** 標準SDXL base構造を対象に、EPS／v-prediction／zero-terminal-SNRのメタデータを扱います。モデル名だけで予測方式を選ばず、配布元の指定を確認してください。
 
-### The Power of TensorRT
-TensorRT optimizes your model specifically for your NVIDIA GPU hardware through:
-* **Kernel Fusion**: Combines multiple operations (like ReLU and Convolution) into a single GPU step to reduce memory overhead.
-* **Optimal Path Selection**: Automatically selects the fastest mathematical algorithms for your specific architecture (e.g., Ada Lovelace, Ampere).
+## 導入
 
-### "Refit" Mechanism: The LoRA Game Changer
-The biggest hurdle for TensorRT in Stable Diffusion was its "static" nature. Typically, changing a weight meant rebuilding the entire engine (3-10 minutes). 
+PyTorch `2.12.1+cu130` とTensorRT `11.4.0.106`（cu13）が既にある環境を前提にしています。ComfyUIを停止し、既存の同名ノードや元のTensorRTノードがあれば `custom_nodes` の外へ退避してください。ノードIDが重複するため、元版との同時導入は避けてください。
 
-**Reforge** solves this by:
-1.  **Marking Weight Buffers**: During the export process, we mark the model's weights as "refittable."
-2.  **Weight Injection**: When you apply a LoRA, Reforge calculates the weight deltas ($W + \Delta W$) and injects them directly into the pre-optimized engine structure.
-3.  **Result**: You get the "Formula 1" speed of TensorRT with the flexibility of LoRA switching in seconds, not minutes.
+PowerShellで `$ComfyRoot` を実際のComfyUI本体フォルダへ変更します。Desktopの配置によってPythonの場所が異なる場合は `$ComfyPython` も変更してください。
 
-## 🛠 Detailed Usage
-
-### 1. Exporting (The "Exporter" Node)
-* **Important Note on Dynamic VRAM (Windows)**: In Windows environments, ONNX Export cannot run while Dynamic VRAM is enabled because memory management conflicts with PyTorch FX graph decomposition. You must start ComfyUI with the `--disable-dynamic-vram` command line argument to export models successfully. *(Note: Depending on your ComfyUI version, this argument might not be recognized. If ComfyUI fails to start due to an unrecognized argument error, you can safely omit it.)*
-* **Profiles**: Select base model and define your target resolution (Width/Height) and Batch Size.
-     * *Note: TensorRT is highly optimized for specific shapes. Fixing the resolution provides the maximum speed boost.*
-* **LoRA Compatibility**: You **must** enable the LoRA option during export if you intend to use them later. This generates a unique `.bundle` file containing the necessary metadata for Refit.
-
-### 2. Loading & Latent Setup
-* Use the **TensorRT Loader Reforge** node to load the generated engine.
-* **CRITICAL**: Your input Latent size (Width/Height) and Batch Size must match the parameters defined during the Export step. Discrepancies will result in a runtime error.
-
-#### Workflow Image
-![ss](readme_images/workflow_anima.png)
-
-## 🤝 Contributing & Community
-
-### 📢 Help Us Reforge!
-If you have tested a specific environment, please let us know in the Issues/Discussions using this format.
-
-To easily collect your package versions, you can run the following command in your terminal:
-```bash
-python -c "import importlib.metadata; pkgs=['coloredlogs','flatbuffers','numpy','packaging','protobuf','sympy','onnx','onnxruntime-gpu','onnxscript','tensorrt-cu12','tensorrt-cu12-libs','tensorrt-cu12-bindings']; [print(f'{p}: {importlib.metadata.version(p)}') for p in pkgs if __import__('contextlib').suppress(importlib.metadata.PackageNotFoundError) or importlib.metadata.distribution(p)]"
+```powershell
+$ComfyRoot = 'C:\path\to\ComfyUI'
+$ComfyPython = Join-Path $ComfyRoot '.venv\Scripts\python.exe'
+$NodeRoot = Join-Path $ComfyRoot 'custom_nodes\ComfyUI-TensorRT-Reforge'
+git clone https://github.com/HarukiKosuda2930/ComfyUI-TensorRT-Reforge.git $NodeRoot
+& $ComfyPython (Join-Path $NodeRoot 'tools\install_deps.py')
+& $ComfyPython (Join-Path $NodeRoot 'tools\diagnose.py')
 ```
-*(Note: You can copy and paste the command above, or refer to the specific versions manually.)*
 
-- **GPU**: (e.g., RTX 4090)
-- **CUDA Version**: (e.g., 12.8)
-- **Package Versions**: (Paste the output of the command above)
-- **Result**: (Success / Specific Error Message)
+追加ライブラリはノード内の `.deps` に置き、既存のsite-packagesを優先します。既存環境と依存条件が衝突する場合はインストーラーが停止します。元版のcu12向けインストール手順や、Managerによる依存関係の自動導入は使用せず、上記手順で配置してください。
 
-### 🗣️ Join the Discussion
-We are actively discussing compatibility with the upcoming CUDA 13.x and next-gen model support. Check out our Compatibility Discussion Thread to share your insights!
+ComfyUIの起動引数に次を追加し、起動します。既存の `--enable-dynamic-vram` は外してください。
 
-### 👨‍💻 Developer's Note
-"Reforge" aims for maximum performance, which often means living on the bleeding edge. While I primarily test on CUDA 12.8, I'm eager to make this project robust for CUDA 13.0 and beyond with your help.
+```text
+--disable-dynamic-vram --use-pytorch-cross-attention
+```
 
----
-*Built with ❤️ for the ComfyUI community.*
+## SDXLでの生成
+
+1. 利用条件を確認したSDXLチェックポイントを自分で用意します。
+2. `TensorRT Exporter Reforge` で、まずFP16・LoRA無効・batch1・1024×1024固定・context mult min/opt/max=1/1/3でengineを構築します。
+3. `.engine` と対応する `.engine.json` を揃えて配置し、`TensorRT Loader Reforge` で `model_type=SDXL`、`sampling=auto` を選択します。
+4. LoaderのMODELをKSamplerへ接続します。CLIPとVAEには同じチェックポイントを使い、latentはengineと同じ解像度・batch1にします。
+
+engineはUNet用です。CLIP、VAE、samplerはComfyUI/PyTorch側で動きます。ビルドにはモデル重み・ONNX外部データ・engineを置く十分なディスク容量が必要です。engineは使用する環境で構築してください。
+
+## 2GPUへのCFG分割
+
+起動引数へ `--cuda-device all` を追加し、次の順に接続します。
+
+```text
+TensorRT Loader Reforge → MultiGPU CFG Split（max_gpus=2）→ KSampler
+```
+
+各GPUが独立したengineと実行コンテキストを持ち、正条件・負条件を並列に計算します。標準的な1枚生成では計算対象が2つなので、`max_gpus=4` にしても画像やUNet自体を4分割しません。同型のRTX 3060×2枚で確認しました。異種GPUや3枚以上は未検証です。[修正内容と検証](MULTIGPU_CFG_FIX.md)
+
+## 制限
+
+- この派生版の実機検証対象は標準SDXL base UNetです。上流の他モデル対応を検証済みとは扱っていません。
+- TensorRT 11でのLoRA/Refit、ControlNet、実行時transformer patchesは未対応で、明示的にエラーになります。
+- IPAdapter、FreeU、量子化、FP8/BF16、SDXL refiner/inpaint、Dynamo経路は未検証または対象外です。
+- モデル本体、engine、ONNX重み、TensorRT本体、仮想環境、`.deps` はこのリポジトリに含みません。
+
+## 検証の再実行
+
+CPU補助テストは、PyTorchとTensorRTが導入済みのPythonで実行します。
+
+```powershell
+& $ComfyPython -m unittest discover -s (Join-Path $NodeRoot 'tests') -v
+```
+
+実機向けの `tools/validate_gpu.py`、`tools/validate_workflow.py`、`tools/validate_multigpu.py` も付属します。使い方は [導入手順](WINDOWS_TRT11_SDXL.md) と各スクリプトの `--help` を参照してください。
+
+## ライセンス
+
+元リポジトリと本派生版のコードは [MIT License](LICENSE) で公開します。元の `Copyright (c) 2024 ComfyUI contributors` と許諾・免責条項を維持し、派生版の追加変更について2026年の著作権表示を追記しています。
+
+モデル、TensorRT、PyTorchなどの外部依存物にはそれぞれのライセンスが適用されます。モデルをengineへ変換しても、元モデルの利用・再配布条件は別途確認してください。

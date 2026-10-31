@@ -1,12 +1,12 @@
 [project]
-name = "comfyui-tensorrt-reforge"
-description = "High-speed TensorRT integration for ComfyUI with LoRA and Refit support, enabling fast inference without sacrificing model flexibility."
-version = "0.1.1"
+name = "comfyui-tensorrt-reforge-trt11"
+description = "Windows SDXL fork for TensorRT 11.4 and CUDA 13, including native two-GPU CFG splitting."
+version = "0.2.0"
 license = { file = "LICENSE" }
 
 [project.urls]
-Repository = "https://github.com/zaochuan5854/ComfyUI-TensorRT-Reforge"
+Repository = "https://github.com/HarukiKosuda2930/ComfyUI-TensorRT-Reforge"
+Issues = "https://github.com/HarukiKosuda2930/ComfyUI-TensorRT-Reforge/issues"
 
 [tool.comfy]
-PublisherId = "zaochuan5854"
-DisplayName = "ComfyUI-TensorRT-Reforge"
+DisplayName = "TensorRT Reforge - TRT11 SDXL fork"

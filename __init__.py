@@ -1,3 +1,12 @@
+import os
+import sys
+
+# Optional dependencies installed beside this node. Existing host packages
+# retain priority, especially torch and TensorRT. No host .venv is modified.
+_deps = os.path.join(os.path.dirname(__file__), ".deps")
+if os.path.isdir(_deps) and _deps not in sys.path:
+    sys.path.append(_deps)
+
 from comfy_api.latest import ComfyExtension
 from comfy_api.latest import io
 

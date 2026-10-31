@@ -4,6 +4,8 @@ from typing_extensions import override, cast, assert_never, Unpack
 import os
 import time
 import json
+import gc
+import hashlib
 from contextlib import contextmanager
 import tqdm
 import numpy as np
@@ -15,13 +17,19 @@ import onnx
 
 import comfy.cli_args
 import comfy.model_patcher
+import comfy.quant_ops
+import comfy.ops
+import comfy.ldm.modules.attention
 from comfy_api.latest import io
-from comfy.ldm.anima.model import LLMAdapter
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from comfy.ldm.anima.model import LLMAdapter
 from comfy import model_base, model_management, sd
 import folder_paths
 
 from .trt_utils import ModelBundle, ensure_temp_or_output_path
 from .definitions import WeightsNameMap, WeightsShapeMap, SupportedModelType, TRTSpec, trt_logger
+from .trt_compat import network_creation_flags, legacy_dynamic_axes, make_export_metadata
 
 
 class TRTExporter(io.ComfyNode):
@@ -48,6 +56,9 @@ class TRTExporter(io.ComfyNode):
                 io.Int.Input(id="opt_batch_size", display_name="Opt Batch Size", default=1, min=1),
 
                 io.Boolean.Input(id="enable_lora", display_name="Enable LoRA (Experimental🧪)", default=False),
+                io.Combo.Input(id="precision", options=["fp16", "fp32"], default="fp16"),
+                io.Combo.Input(id="onnx_exporter", options=["auto", "legacy", "dynamo"], default="auto"),
+                io.Int.Input(id="workspace_gib", default=1, min=1, max=16),
                 io.Int.Input(id="opt_context_mult", display_name="Opt Context Multiplier", default=1, min=1),
                 io.Int.Input(id="num_video_frames", display_name="Num Video Frames", default=1, min=1),
                 io.String.Input(id="filename_prefix", display_name="Filename Prefix", default="tensorrt/"),
@@ -74,9 +85,14 @@ class TRTExporter(io.ComfyNode):
 
         model_name = kwargs["model_name"]
 
-        model_source, model_patcher = _load_model_from_basename(model_name)
-
         spec = _adjust_spec_range(kwargs)
+        precision = spec.get("precision", "fp16")
+        dtype = {"fp16": torch.float16, "fp32": torch.float32}[precision]
+        if int(trt.__version__.split('.')[0]) >= 11 and spec["enable_lora"]:
+            raise ValueError("TensorRT 11 SDXL compatibility mode requires enable_lora=False. "
+                             "Refit/LoRA conversion has not been validated for this mode.")
+        model_source, model_patcher = _load_model_from_basename(model_name, dtype=dtype)
+
         del kwargs
 
         min_batch_size, opt_batch_size, max_batch_size = spec["min_batch_size"], spec["opt_batch_size"], spec["max_batch_size"]
@@ -98,6 +114,14 @@ class TRTExporter(io.ComfyNode):
         model_type = SupportedModelType.from_instance(diffusion_model)
 
         context_len_min, context_len, context_dim, dtype = _get_context_features(model_type, unet_config)
+        if model_type == SupportedModelType.SDXL:
+            dtype = {"fp16": torch.float16, "fp32": torch.float32}[precision]
+            if context_dim != 2048 or diffusion_model.adm_channels != 2816 or unet_config.get("in_channels", 4) != 4:
+                raise ValueError("This compatibility mode supports standard SDXL base UNets (4/2048/2816).")
+            for key in ("min_width", "opt_width", "max_width", "min_height", "opt_height", "max_height"):
+                if spec[key] < 64 or spec[key] % 64:
+                    raise ValueError(f"{key} must be a positive multiple of 64 for SDXL export.")
+            diffuser.to(dtype=dtype)
 
         use_rope3d = unet_config.get("pos_emb_cls", "None") == "rope3d" if unet_config is not None else False
         num_video_frames = spec["num_video_frames"]
@@ -128,7 +152,11 @@ class TRTExporter(io.ComfyNode):
         output_onnx = ensure_temp_or_output_path(output_onnx)
         os.makedirs(os.path.dirname(output_onnx), exist_ok=True)
 
-        print("[TensorRT] Exporting ONNX Model (Dynamo=True) ...")
+        exporter = spec.get("onnx_exporter", "auto")
+        use_dynamo = exporter == "dynamo" or (exporter == "auto" and model_type != SupportedModelType.SDXL)
+        if not use_dynamo and model_type not in (SupportedModelType.SDXL, SupportedModelType.SD15):
+            raise ValueError("The legacy ONNX exporter is supported only for SDXL/SD15.")
+        print(f"[TensorRT] Exporting ONNX Model (dynamo={use_dynamo}, dtype={dtype}) ...")
         # Anima is supported in opset 25
         
         match model_type:
@@ -139,7 +167,12 @@ class TRTExporter(io.ComfyNode):
 
         enable_lora = spec["enable_lora"]
 
-        with _prepare_model_for_onnx_export():
+        metadata = make_export_metadata(diffusion_model, model_type, spec, input_names,
+                                        inputs_shapes_min, inputs_shapes_opt, inputs_shapes_max)
+        export_options = ({"dynamic_shapes": dynamic_shapes, "optimize": not enable_lora}
+                          if use_dynamo else {"dynamic_axes": legacy_dynamic_axes(
+                              input_names, inputs_shapes_min, inputs_shapes_max, output_names)})
+        with _prepare_model_for_onnx_export(), torch.inference_mode():
             torch.onnx.export( # pyright: ignore[reportUnknownMemberType]
                 tracing_model.eval(),
                 inputs,
@@ -148,8 +181,9 @@ class TRTExporter(io.ComfyNode):
                 input_names=input_names,
                 output_names=output_names,
                 opset_version=opset_version,
-                dynamic_shapes=dynamic_shapes,
-                dynamo=True,
+                **export_options,
+                external_data=True,
+                dynamo=use_dynamo,
                 do_constant_folding=False if enable_lora else True, # Constant folding can interfere with LoRA weight mapping, so disable it when LoRA is enabled
             )
 
@@ -164,24 +198,29 @@ class TRTExporter(io.ComfyNode):
         else:
             output_mapping = None
 
+        required_llmadapter = model_type == SupportedModelType.Anima
+        llm_adapter = diffuser.llm_adapter if required_llmadapter else None
         model_management.unload_all_models()
+        # GPU dummy inputs would otherwise remain resident during the TRT build.
+        del inputs, tracing_model, diffuser, diffusion_model, model_patcher
+        gc.collect()
         model_management.soft_empty_cache()
 
         print("[TensorRT] Building TensorRT Engine ...")
 
         output_dir = os.path.join(folder_paths.get_output_directory(), os.path.dirname(spec["filename_prefix"]))
         basename_prefix = os.path.basename(spec["filename_prefix"])
-        basename = basename_prefix + _trt_spec_to_string(spec) + f".{model_type.name}"
+        basename = basename_prefix + os.path.splitext(os.path.basename(model_name))[0] + "_" + _trt_spec_to_string(spec) + f"_{precision}.{model_type.name}"
         trt_output_path = os.path.join(output_dir, f"{basename}.engine")
         os.makedirs(os.path.dirname(trt_output_path), exist_ok=True)
 
         _build_tensorrt_engine(
-            output_onnx, input_names, inputs_shapes_min, inputs_shapes_opt, inputs_shapes_max, trt_output_path, enable_lora=spec["enable_lora"]
+            output_onnx, input_names, inputs_shapes_min, inputs_shapes_opt, inputs_shapes_max, trt_output_path, enable_lora=spec["enable_lora"], workspace_gib=spec.get("workspace_gib", 1)
         )
+        with open(trt_output_path + ".json", "w", encoding="utf-8") as metadata_file:
+            json.dump(metadata, metadata_file, indent=2)
 
         print(f"[TensorRT] Conversion completed. Saved to {trt_output_path}")
-
-        required_llmadapter = model_type == SupportedModelType.Anima
 
         if not (enable_lora or required_llmadapter):
             return io.NodeOutput()
@@ -190,7 +229,6 @@ class TRTExporter(io.ComfyNode):
         bundle_out = os.path.join(output_dir, f"{basename}.bundle")
         if required_llmadapter:
             print("[TensorRT] Exporting LLMAdapter to ONNX ...")
-            llm_adapter = cast(LLMAdapter, diffuser.llm_adapter)
             output_onnx_llm_adapter = os.path.normpath(os.path.join(temp_dir, f"trt_{time.time()}", "llm_adapter.onnx"))
             _export_anima_llmadapter_to_onnx(llm_adapter, output_onnx_llm_adapter, dtype)
             print(f"[TensorRT] LLMAdapter ONNX export completed. Saved to {output_onnx_llm_adapter}")
@@ -211,7 +249,10 @@ class TRTExporter(io.ComfyNode):
             with open(output_mapping, encoding="utf-8") as mapping_file:
                 json_mapping = json.load(mapping_file)
             bundle.save_weights_mapping(json_mapping["weights_name_mapping"], json_mapping["weights_shape_mapping"])
-            bundle.metadata = {"source_model": model_source}
+            bundle.metadata = {"source_model": model_source, "export_metadata": metadata}
+        else:
+            bundle.metadata = {"export_metadata": metadata}
+        bundle.close()
         
         return io.NodeOutput()
 
@@ -255,6 +296,13 @@ def _prepare_model_for_onnx_export():
     comfy.model_management.in_training = True
 
     ck = getattr(comfy.quant_ops, "ck", None)
+    attention = comfy.ldm.modules.attention
+    originals = [(attention, "optimized_attention", attention.optimized_attention),
+                 (attention, "optimized_attention_masked", attention.optimized_attention_masked),
+                 (comfy.ops, "scaled_dot_product_attention", comfy.ops.scaled_dot_product_attention)]
+    attention.optimized_attention = attention.attention_pytorch
+    attention.optimized_attention_masked = attention.attention_pytorch
+    comfy.ops.scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
 
     def _apply_rope_split_half1_eager(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         t_ = x.reshape(*x.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2).to(freqs_cis.dtype)
@@ -274,14 +322,18 @@ def _prepare_model_for_onnx_export():
             )
 
     try:
-        yield
+        # Keep fused CUDA/Sage/xFormers kernels out of the ONNX graph.
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            yield
     finally:
         comfy.model_management.in_training = prev_in_training
+        for owner, name, original in reversed(originals):
+            setattr(owner, name, original)
         if ck is not None:
             for attr_name, original_value in reversed(patched_attrs):
                 setattr(ck, attr_name, original_value)
     
-def _load_model_from_basename(model_name: str) -> tuple[str, comfy.model_patcher.ModelPatcher]:
+def _load_model_from_basename(model_name: str, dtype: torch.dtype = torch.float16) -> tuple[str, comfy.model_patcher.ModelPatcher]:
     model_source = None
     model_patcher = None
     
@@ -303,13 +355,14 @@ def _load_model_from_basename(model_name: str) -> tuple[str, comfy.model_patcher
             output_vae=False,
             output_clip=False,
             output_clipvision=False,
-            embedding_directory=folder_paths.get_folder_paths("embeddings")
+            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            model_options={"dtype": dtype}, disable_dynamic=True
         )
         if model_patcher is None:
             raise ValueError(f"Failed to load model patcher from checkpoint: {checkpoint_path}")
     elif has_diffusion:
         model_source = diffusion_path
-        model_patcher = sd.load_diffusion_model(diffusion_path) # pyright: ignore[reportUnknownMemberType]
+        model_patcher = sd.load_diffusion_model(diffusion_path, model_options={"dtype": dtype}, disable_dynamic=True)
     else:
         raise FileNotFoundError(f"Model not found in checkpoints or diffusion_models: {model_name}")
     
@@ -403,7 +456,7 @@ def _get_context_features(model_type: SupportedModelType, unet_config: Optional[
             if _context_dim is None:
                 raise NotImplementedError("Unsupported model configuration: context_dim is required for SDXL")
             context_dim = _context_dim
-            context_len = 231
+            context_len = 77
             context_len_min = 77
             dtype = unet_config.get("dtype", torch.float32) if unet_config is not None else torch.float32
         case _:
@@ -493,7 +546,9 @@ def _build_onnx_tracing_input(
         inputs_shapes_max += ((bs_max,) + v,)
 
     device = cast(torch.device, model_management.get_torch_device())
-    inputs: tuple[torch.Tensor, ...] = tuple(torch.zeros(shape, device=device, dtype=dtype) for shape in inputs_shapes_max)
+    inputs: tuple[torch.Tensor, ...] = tuple(
+        torch.zeros(shape, device=device, dtype=torch.float32 if name == "timestep" else dtype)
+        for name, shape in zip(input_names, inputs_shapes_opt))
     
     return inputs, inputs_shapes_min, inputs_shapes_opt, inputs_shapes_max, input_names, output_names, dynamic_shapes
 
@@ -544,13 +599,14 @@ def _build_tensorrt_engine(
     inputs_shapes_max: tuple[tuple[int, ...], ...],
     output_path: str,
     enable_lora: bool,
+    workspace_gib: int = 1,
 ) -> None:
     if trt is None:
         raise RuntimeError("TensorRT is not installed but required for compilation.")
 
     builder = trt.Builder(trt_logger)
 
-    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
+    network = builder.create_network(network_creation_flags())
     parser = trt.OnnxParser(network, trt_logger)
     success = parser.parse_from_file(target_onnx)
     for idx in range(parser.num_errors):
@@ -560,12 +616,14 @@ def _build_tensorrt_engine(
         raise RuntimeError("ONNX parse ERROR")
 
     config = builder.create_builder_config()
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gib * (1 << 30))
     if enable_lora:
         config.set_flag(trt.BuilderFlag.REFIT)
     profile = builder.create_optimization_profile()
     
     temp_dir = folder_paths.get_temp_directory()
-    timing_cache_path = os.path.join(temp_dir, "timing_cache", "timing_cache.trt")
+    cache_key = hashlib.sha256(f"{trt.__version__}/{torch.cuda.get_device_name()}/{torch.cuda.get_device_capability()}/{workspace_gib}/{enable_lora}".encode()).hexdigest()[:16]
+    timing_cache_path = os.path.join(temp_dir, "timing_cache", f"timing_cache_{cache_key}.trt")
     timing_cache_path = ensure_temp_or_output_path(timing_cache_path)
     os.makedirs(os.path.dirname(timing_cache_path), exist_ok=True)
     if os.path.exists(timing_cache_path):
@@ -574,14 +632,19 @@ def _build_tensorrt_engine(
     else:
         buffer = b""
     timing_cache = config.create_timing_cache(buffer)
-    config.set_timing_cache(timing_cache, ignore_mismatch=True)
+    if not config.set_timing_cache(timing_cache, ignore_mismatch=False):
+        raise RuntimeError("Incompatible TensorRT timing cache; remove this node's timing cache and retry.")
     
     for k in range(len(input_names)):
-        profile.set_shape(input_names[k], trt.Dims(inputs_shapes_min[k]), trt.Dims(inputs_shapes_opt[k]), trt.Dims(inputs_shapes_max[k]))
+        # Python set_shape raises ValueError and returns None on success.
+        profile.set_shape(input_names[k], inputs_shapes_min[k], inputs_shapes_opt[k], inputs_shapes_max[k])
         
-    config.add_optimization_profile(profile)
+    if config.add_optimization_profile(profile) < 0:
+        raise RuntimeError("TensorRT rejected the optimization profile.")
 
     serialized_engine = builder.build_serialized_network(network, config)
+    if serialized_engine is None:
+        raise RuntimeError("TensorRT engine build failed. Check the TensorRT log above (types, unsupported operators, or VRAM). ONNX files were retained.")
     
     output_path = ensure_temp_or_output_path(output_path)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -661,7 +724,7 @@ def _trt_spec_to_string(spec: TRTSpec) -> str:
 
     return s
 
-def _export_anima_llmadapter_to_onnx(llm_adapter: LLMAdapter, output_path: str, dtype: torch.dtype):
+def _export_anima_llmadapter_to_onnx(llm_adapter: "LLMAdapter", output_path: str, dtype: torch.dtype):
     output_path = ensure_temp_or_output_path(output_path)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
